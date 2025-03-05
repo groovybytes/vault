@@ -35,7 +35,7 @@ class HomeFragment : Fragment() {
         keyVault = SecureKeyVault(requireContext(), this)
         keyVault.init {}
 
-        _vaultAdapter = VaultViewAdapter(_db!!.getVaults(), keyVault)
+        _vaultAdapter = VaultViewAdapter(_db!!, keyVault, requireContext())
         binding.vaultsHomeViewer.setLayoutManager(LinearLayoutManager(binding.vaultsHomeViewer.context))
         binding.vaultsHomeViewer.setAdapter(_vaultAdapter)
 

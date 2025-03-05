@@ -37,7 +37,7 @@ class SearchFragment : Fragment() {
         keyVault = SecureKeyVault(requireContext(), this)
         keyVault.init {}
 
-        _vaultAdapter = VaultViewAdapter(_db!!.getVaults(), keyVault)
+        _vaultAdapter = VaultViewAdapter(_db!!, keyVault, requireContext())
         binding.vaultsSearchViewer.setLayoutManager(LinearLayoutManager(binding.vaultsSearchViewer.context))
         binding.vaultsSearchViewer.setAdapter(_vaultAdapter)
 

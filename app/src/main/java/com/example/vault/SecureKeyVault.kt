@@ -1,11 +1,13 @@
 package com.example.vault
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
@@ -61,24 +63,43 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
         )
     }
 
+    // Check if the device supports biometrics or device credentials
+    private fun canAuthenticate(): Boolean {
+        val biometricManager = BiometricManager.from(context)
+        val canAuthenticate = biometricManager.canAuthenticate(BIOMETRIC_STRONG or DEVICE_CREDENTIAL)
+        return canAuthenticate == BiometricManager.BIOMETRIC_SUCCESS
+    }
+
     // Retrieve or generate a master key
     fun authenticate(
         onSuccess: (ByteArray) -> Unit,
         onFailure: (String) -> Unit
     ) {
-        val encryptedPrefs = getEncryptedPrefs()
+        try {
+            if (!canAuthenticate()) {
+                onFailure("Device does not support biometrics or device credentials")
+                return
+            }
 
-        // Check if master key exists
-        val encryptedMasterKeyBase64 = encryptedPrefs.getString(ENCRYPTED_MASTER_KEY_ACCESS_KEY, null)
-        val masterKeyInitializationVectorBase64 = encryptedPrefs.getString(INITIALIZATION_VECTOR_ACCESS_KEY, null)
-        if (encryptedMasterKeyBase64 != null && masterKeyInitializationVectorBase64 != null) {
-            // Decrypt and return the existing master key
-            val encryptedMasterKey = Base64.decode(encryptedMasterKeyBase64, Base64.DEFAULT)
-            val iv = Base64.decode(masterKeyInitializationVectorBase64, Base64.DEFAULT)
-            accessMasterKeyUsingBiometrics(encryptedMasterKey, iv, onSuccess, onFailure)
-        } else {
-            // Generate and store a new master key
-            generateMasterKeyUsingBiometrics(encryptedPrefs, onSuccess, onFailure)
+            val encryptedPrefs = getEncryptedPrefs()
+
+            // Check if master key exists
+            val encryptedMasterKeyBase64 =
+                encryptedPrefs.getString(ENCRYPTED_MASTER_KEY_ACCESS_KEY, null)
+            val masterKeyInitializationVectorBase64 =
+                encryptedPrefs.getString(INITIALIZATION_VECTOR_ACCESS_KEY, null)
+
+            if (encryptedMasterKeyBase64 != null && masterKeyInitializationVectorBase64 != null) {
+                // Decrypt and return the existing master key
+                val encryptedMasterKey = Base64.decode(encryptedMasterKeyBase64, Base64.DEFAULT)
+                val iv = Base64.decode(masterKeyInitializationVectorBase64, Base64.DEFAULT)
+                accessMasterKeyUsingBiometrics(encryptedMasterKey, iv, onSuccess, onFailure)
+            } else {
+                // Generate and store a new master key
+                generateMasterKeyUsingBiometrics(encryptedPrefs, onSuccess, onFailure)
+            }
+        } catch (e: Exception) {
+            onFailure("Failed to authenticate: ${e.message}")
         }
     }
 
@@ -216,6 +237,10 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
                 .setEncryptionPaddings(ENCRYPTION_PADDING)
                 .setKeySize(ENCRYPTION_KEY_SIZE)
                 .setUserAuthenticationRequired(true) // Enforces user authentication
+                .setUserAuthenticationParameters(
+                    0, // Duration for which the key is usable after authentication (0 for immediate re-authentication)
+                    KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL // Allow both biometrics and device credentials
+                )
                 .setInvalidatedByBiometricEnrollment(false) // Prevents invalidation when biometrics change
                 .build()
         )
@@ -285,8 +310,12 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
      * Preserves the folder structure using DocumentFile.
      */
     @OptIn(ExperimentalUnsignedTypes::class)
-    fun encryptDocumentFolder(folder: DocumentFile, vaultKey: ByteArray, masterKey: ByteArray): Pair<DocumentFile, ByteArray> {
-        val vaultNonce = generateNonce()
+    fun encryptDocumentFolder(
+        folder: DocumentFile,
+        vaultKey: ByteArray,
+        masterKey: ByteArray,
+        vaultNonce: UByteArray = generateNonce()
+    ): Pair<DocumentFile, ByteArray> {
         folder.listFiles().forEach { file ->
             if (file.isFile) {
 
@@ -372,19 +401,54 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
 
     /**
      * Retrieves a DocumentFile representing a folder based on the provided URI.
+     * Ensures the folder is accessible and persists permissions for future access.
      *
      * @param folderUri The SAF URI for the folder.
+     * @param persistPermissions Whether to persist read/write permissions for the folder URI.
      * @return The DocumentFile object representing the folder.
      * @throws IllegalArgumentException If the URI is invalid or the folder does not exist.
      */
-    fun getDocumentFolder(folderUri: Uri): DocumentFile {
+    fun getDocumentFolder(folderUri: Uri, persistPermissions: Boolean = true): DocumentFile {
+        // Persist permissions if requested
+        if (persistPermissions) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    folderUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (e: SecurityException) {
+                throw IllegalArgumentException("Failed to persist permissions for URI: $folderUri", e)
+            }
+        }
+
+        // Retrieve the DocumentFile for the folder
         val documentFolder = DocumentFile.fromTreeUri(context, folderUri)
 
-        // Ensure the folder exists
+        // Validate the folder
         if (documentFolder == null || !documentFolder.isDirectory) {
             throw IllegalArgumentException("The folder does not exist or is not a valid directory: $folderUri")
         }
 
+        // Check if the folder is accessible
+        if (!isUriAccessible(documentFolder.uri)) {
+            throw IllegalArgumentException("The folder is not accessible: $folderUri")
+        }
+
         return documentFolder
     }
+
+    /**
+     * Checks if a URI is accessible by attempting to open a stream.
+     *
+     * @param uri The URI to check.
+     * @return True if the URI is accessible, false otherwise.
+     */
+    private fun isUriAccessible(uri: Uri): Boolean {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { true } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
 }

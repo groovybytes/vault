@@ -13,7 +13,8 @@ data class Vault(
 
     val path: String,
     val encryptedKey: ByteArray,
-    val vaultNonce: ByteArray
+    val vaultNonce: ByteArray,
+    val mode: String
 )
 
 class VaultDatabase(context : Context?, name : String?, factory : SQLiteDatabase.CursorFactory?, version: Int = 1) : SQLiteOpenHelper(context, name, factory, version) {
@@ -28,7 +29,8 @@ class VaultDatabase(context : Context?, name : String?, factory : SQLiteDatabase
                 PATH TEXT NOT NULL,
                 DESCRIPTION TEXT,
                 ENCRYPTED_KEY BLOB NOT NULL,
-                VAULT_NONCE BLOB NOT NULL
+                VAULT_NONCE BLOB NOT NULL,
+                MODE TEXT NOT NULL
             )
             """
         )
@@ -49,9 +51,29 @@ class VaultDatabase(context : Context?, name : String?, factory : SQLiteDatabase
             put("DESCRIPTION", vault.description)
             put("ENCRYPTED_KEY", vault.encryptedKey)
             put("VAULT_NONCE", vault.vaultNonce)
+            put("MODE", vault.mode)
         }
 
         sqLiteDatabase.insert("Vaults", null, contentValues)
+    }
+
+    fun updateVault(vault: Vault) {
+        val sqLiteDatabase = this.writableDatabase
+        val contentValues = ContentValues().apply {
+            put("PATH", vault.path)
+            put("TITLE", vault.title)
+            put("DESCRIPTION", vault.description)
+            put("ENCRYPTED_KEY", vault.encryptedKey)
+            put("VAULT_NONCE", vault.vaultNonce)
+            put("MODE", vault.mode)
+        }
+
+        sqLiteDatabase.update("Vaults", contentValues, "ID = ?", arrayOf(vault.id.toString()))
+    }
+
+    fun deleteVault(id: Int) {
+        val sqLiteDatabase = this.writableDatabase
+        sqLiteDatabase.delete("Vaults", "ID = ?", arrayOf(id.toString()))
     }
 
     // Retrieves all vaults from the database.
@@ -77,6 +99,7 @@ class VaultDatabase(context : Context?, name : String?, factory : SQLiteDatabase
         val PATH_COL = results.getColumnIndex("PATH")
         val ENCRYPTED_KEY_COL = results.getColumnIndex("ENCRYPTED_KEY")
         val VAULT_NONCE_COL = results.getColumnIndex("VAULT_NONCE")
+        val MODE_COL = results.getColumnIndex("MODE")
 
         while (results.moveToNext()) {
             val id = results.getInt(ID_COL)
@@ -86,8 +109,19 @@ class VaultDatabase(context : Context?, name : String?, factory : SQLiteDatabase
             val path = results.getString(PATH_COL)
             val encryptedKey = results.getBlob(ENCRYPTED_KEY_COL)
             val vaultNonce = results.getBlob(VAULT_NONCE_COL)
+            val mode = results.getString(MODE_COL)
 
-            vaults.add(Vault(id, path, title, description, encryptedKey, vaultNonce))
+            vaults.add(
+                Vault(
+                    id=id,
+                    title=title,
+                    description=description,
+                    path=path,
+                    encryptedKey=encryptedKey,
+                    vaultNonce=vaultNonce,
+                    mode=mode
+                )
+            )
         }
 
         results.close()
