@@ -21,6 +21,7 @@ retrofit = "2.9.0"
 androidXBrowser = "1.8.0"
 securityCrypto = "1.0.0"
 securityCryptoKtx = "1.0.0"
+annotation = "1.6.0"
 
 [libraries]
 androidx-biometric = { module = "androidx.biometric:biometric", version.ref = "biometric" }
@@ -47,6 +48,7 @@ retrofit-gson = { module = "com.squareup.retrofit2:converter-gson", version.ref 
 okhttp-logging-interceptor = { module = "com.squareup.okhttp3:logging-interceptor" }
 androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "androidXBrowser" }
 androidx-security-crypto-ktx = { group = "androidx.security", name = "security-crypto-ktx", version.ref = "securityCryptoKtx" }
+androidx-annotation = { group = "androidx.annotation", name = "annotation", version.ref = "annotation" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -41,6 +41,13 @@ class MainActivity : AppCompatActivity() {
             )
         )
 
+
+
+        // Start with the master unlock screen
+        if (savedInstanceState == null) {
+            navController.navigate(R.id.master_unlock_fragment)
+        }
+
         // Setup navigation components
         navView.setupWithNavController(navController)
         setupActionBarWithNavController(navController, appBarConfiguration)

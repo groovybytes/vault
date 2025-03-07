@@ -9,3 +9,5 @@ MAPS_API_KEY=[GOOGLE_MAPS_API_KEY]
 ```
 
 We ran the program using Android Studio so we recommend you to use it as well.
+
+Use light mode for the app, it crashes for some odd reason in dark mode.

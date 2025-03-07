@@ -64,4 +64,15 @@
             app:destination="@id/navigation_home" />
     </fragment>
 
+    <!-- Master Unlock Fragment -->
+    <fragment
+        android:id="@+id/master_unlock_fragment"
+        android:name="com.example.vault.ui.login.MasterUnlockFragment"
+        android:label="Master Unlock"
+        tools:layout="@layout/fragment_master_unlock">
+        <action
+            android:id="@+id/action_navigation_master_unlock_to_navigation_home"
+            app:destination="@id/navigation_home" />
+    </fragment>
+
 </navigation>

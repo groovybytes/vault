@@ -62,7 +62,20 @@ class VaultViewAdapter(private var db: VaultDatabase, private var keyVault: Secu
             //todo: add encryption functionality
             keyVault.init {
                 keyVault.authenticate(
-                    onSuccess = { masterKey ->
+                    masterKey = null,
+                    onSuccess = { masterKey, recoveryKey ->
+
+                        if (recoveryKey != null) {
+                            val clipboard = holder.itemView.context
+                                .getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                            val clip = android.content.ClipData.newPlainText("Recovery Key", recoveryKey)
+                            clipboard.setPrimaryClip(clip)
+                            Toast.makeText(
+                                holder.itemView.context,
+                                "Recovery key copied to clipboard!",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
 
                         val message = "Hello, world!".encodeToUByteArray()
                         val (encryptedData, nonce) = keyVault.encryptData(message, masterKey)
