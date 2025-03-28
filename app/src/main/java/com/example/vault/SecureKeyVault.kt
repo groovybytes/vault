@@ -12,32 +12,79 @@ import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import androidx.documentfile.provider.DocumentFile
 import androidx.fragment.app.Fragment
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
+import com.ionspin.kotlin.crypto.box.Box
+import com.ionspin.kotlin.crypto.pwhash.PasswordHash
+import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_argon2id_ALG_ARGON2ID13
 import com.ionspin.kotlin.crypto.secretbox.SecretBox
 import com.ionspin.kotlin.crypto.secretbox.crypto_secretbox_NONCEBYTES
+import com.ionspin.kotlin.crypto.secretstream.SecretStream
+import com.ionspin.kotlin.crypto.secretstream.crypto_secretstream_xchacha20poly1305_TAG_FINAL
+import com.ionspin.kotlin.crypto.secretstream.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE
 import com.ionspin.kotlin.crypto.util.LibsodiumRandom
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.yield
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
-import androidx.core.content.edit
-import com.ionspin.kotlin.crypto.hash.Hash
-import com.ionspin.kotlin.crypto.pwhash.PasswordHash
+import kotlin.coroutines.cancellation.CancellationException
+import kotlin.coroutines.coroutineContext
+
+/**
+ * Represents the result of encrypting a key (or vault) that is wrapped.
+ */
+data class WrappedKeyResult(
+  val encryptedKey: ByteArray,    // The wrapped key (e.g. file key or vault key)
+  val wrappingNonce: ByteArray    // The nonce used in the wrapping process
+)
+
+/**
+ * Represents the result of encrypting file data.
+ */
+data class FileEncryptionResult(
+  val encryptedFileData: ByteArray, // The ciphertext of the file content
+  val dataNonce: ByteArray, // The nonce used in the wrapping process
+  val wrappedFileKey: WrappedKeyResult // The wrapped file key result
+)
+
+/**
+ * Holds information derived from a credential.
+ */
+data class CredentialInfo(
+  val derivedKEK: ByteArray,
+  val encryptedKeyKey: String,
+  val ivKey: String,
+  val isRecovery: Boolean
+)
+
 
 class SecureKeyVault(private val context: Context, private val activity: Fragment) {
 
   companion object {
+    const val RECOVERY_KEY_PREFIX = "+RECV*"
+
     private const val ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore"
     private const val VAULT_KEYSTORE_ALIAS = "VaultKeyStoreAlias"
     private const val VAULT_PREFS_ACCESS_KEY = "VaultSharedPrefs"
-    private const val ENCRYPTED_MASTER_KEY_ACCESS_KEY = "EncryptedMasterKey"
-    private const val INITIALIZATION_VECTOR_ACCESS_KEY = "InitializationVector"
-    private const val RECOVERY_KEY_PREFIX = "REC"
+
+    private const val PASSWORD_HASH_SALT_ACCESS_KEY = "PasswordHashSalt"
+
+    private const val ENCRYPTED_MASTER_KEY_BIO_ACCESS_KEY = "EncryptedMasterKeyBIO"
+    private const val INITIALIZATION_VECTOR_BIO_ACCESS_KEY = "InitializationVectorBIO"
+
+    private const val ENCRYPTED_MASTER_KEY_PW_ACCESS_KEY = "EncryptedMasterKeyPW"
+    private const val INITIALIZATION_VECTOR_PW_ACCESS_KEY = "InitializationVectorPW"
+
+    private const val ENCRYPTED_MASTER_KEY_RK_ACCESS_KEY = "EncryptedMasterKeyRK"
+    private const val INITIALIZATION_VECTOR_RK_ACCESS_KEY = "InitializationVectorRK"
 
     private val MASTER_KEY_ALIAS = MasterKeys.AES256_GCM_SPEC
 
@@ -46,16 +93,86 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
     private const val ENCRYPTION_ALGORITHM = KeyProperties.KEY_ALGORITHM_AES
     private const val ENCRYPTION_KEY_SIZE = 256
 
+    // Argon2id parameters
+    private const val ARGON2_SALT_LENGTH = 16
+    private const val ARGON2_TIME_COST = 3
+
+    private const val ARGON2_MEMORY_COST = 8 * 1024 * 1024
+    private const val ARGON2_OUTPUT_LENGTH = 32
+
+    // Create EncryptedSharedPreferences instance
+    private fun getEncryptedPrefs(context: Context): SharedPreferences {
+      val masterKeyAlias = MasterKeys.getOrCreate(MASTER_KEY_ALIAS)
+      return EncryptedSharedPreferences.create(
+        VAULT_PREFS_ACCESS_KEY,
+        masterKeyAlias,
+        context,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+      )
+    }
+
     /**
-     * Derives a 32-byte key from the given password using SHA-512.
+     * Derives a 32-byte key from the given password (or recovery key) using Argon2id.
+     * The salt is securely stored in EncryptedSharedPreferences.
+     *
+     * @param password The user password (optional if recoveryKey is provided).
+     * @param recoveryKey The recovery key (optional if password is provided).
+     * @param context The Android context used for accessing secure storage.
+     *
+     * @return The derived key as a UByteArray.
      */
     @OptIn(ExperimentalUnsignedTypes::class)
-    fun deriveKeyFromPassword(password: String): UByteArray {
-      return Hash.sha512(
-        password
-          .toByteArray(Charsets.UTF_8)
-          .toUByteArray()
+    fun deriveKeyFromPassword(
+      password: String? = null,
+      recoveryKey: String? = null,
+      context: Context
+    ): UByteArray {
+      require(password != null || recoveryKey != null) {
+        "Either a password or a recovery key must be provided"
+      }
+
+      val encryptedPrefs = getEncryptedPrefs(context)
+      val saltBase64 = encryptedPrefs.getString(PASSWORD_HASH_SALT_ACCESS_KEY, null)
+
+      val salt: UByteArray = if (saltBase64 != null) {
+        Base64.decode(saltBase64, Base64.DEFAULT).toUByteArray()
+      } else {
+        val newSalt = LibsodiumRandom.buf(ARGON2_SALT_LENGTH)
+        val newSaltBase64 = Base64.encodeToString(newSalt.toByteArray(), Base64.DEFAULT)
+        encryptedPrefs.edit { putString(PASSWORD_HASH_SALT_ACCESS_KEY, newSaltBase64) }
+        newSalt.toUByteArray()
+      }
+
+      val keyInput: String = recoveryKey?.removePrefix("$RECOVERY_KEY_PREFIX-") ?: password!!
+      return PasswordHash.pwhash(
+        outputLength = ARGON2_OUTPUT_LENGTH,
+        password = keyInput, // or recovery key if applicable
+        salt = salt,
+        opsLimit = ARGON2_TIME_COST.toULong(),  // mapping our time cost
+        memLimit = ARGON2_MEMORY_COST,          // our memory cost in bytes
+        algorithm = crypto_pwhash_argon2id_ALG_ARGON2ID13  // constant from libsodium for Argon2id
       )
+    }
+
+    /**
+     * Resolves the KEK and storage keys based on the provided credential.
+     */
+    @OptIn(ExperimentalUnsignedTypes::class)
+    private fun resolveCredentialInfo(credential: String, context: Context): CredentialInfo {
+      val isRecovery = credential.startsWith("$RECOVERY_KEY_PREFIX-")
+      val derivedKEK = deriveKeyFromPassword(
+        if (isRecovery) null else credential,
+        if (isRecovery) credential else null,
+        context
+      ).toByteArray()
+
+      val (encryptedKeyKey, ivKey) = if (isRecovery) {
+        Pair(ENCRYPTED_MASTER_KEY_RK_ACCESS_KEY, INITIALIZATION_VECTOR_RK_ACCESS_KEY)
+      } else {
+        Pair(ENCRYPTED_MASTER_KEY_PW_ACCESS_KEY, INITIALIZATION_VECTOR_PW_ACCESS_KEY)
+      }
+      return CredentialInfo(derivedKEK, encryptedKeyKey, ivKey, isRecovery)
     }
   }
 
@@ -68,18 +185,6 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
     }
   }
 
-  // Create EncryptedSharedPreferences instance
-  private fun getEncryptedPrefs(): SharedPreferences {
-    val masterKeyAlias = MasterKeys.getOrCreate(MASTER_KEY_ALIAS)
-    return EncryptedSharedPreferences.create(
-      VAULT_PREFS_ACCESS_KEY,
-      masterKeyAlias,
-      context,
-      EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-      EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-    )
-  }
-
   // Check if the device supports biometrics or device credentials
   private fun canAuthenticate(): Boolean {
     val biometricManager = BiometricManager.from(context)
@@ -87,52 +192,128 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
     return canAuthenticate == BiometricManager.BIOMETRIC_SUCCESS
   }
 
-
   /**
-   * MASTER LOCK BIOMETRIC FLOW
+   * Supports both biometric and KEK-based (password or recovery key) flows.
    *
-   * This flow is available as a convenience mechanism to unlock (or generate) the master key,
-   * which is normally derived (hashed) from the user’s master password.
-   * A recovery key is generated during master unlock.
+   * @param masterKey Optional master key (if provided externally).
+   * @param credential Optional credential string. If provided, the KEK-based flow is used.
+   *                   It can be a password or a recovery key (indicated by the RECOVERY_KEY_PREFIX).
+   * @param onSuccess Callback with the decrypted (or newly generated) master key and an optional recovery key.
+   * @param onFailure Callback with an error message.
    */
   @OptIn(ExperimentalUnsignedTypes::class)
   fun authenticate(
-    masterKey: ByteArray?,
+    credential: String?,
     onSuccess: (ByteArray, recoveryKey: String?) -> Unit,
     onFailure: (String) -> Unit
   ) {
     try {
-      if (!canAuthenticate()) {
-        onFailure("Device does not support biometrics or device credentials")
-        return
-      }
+      println("Starting authenticate. Credential provided: ${credential != null}")
 
-      val encryptedPrefs = getEncryptedPrefs()
-
-      // Check if master key exists
-      val encryptedMasterKeyBase64 =
-        encryptedPrefs.getString(ENCRYPTED_MASTER_KEY_ACCESS_KEY, null)
-      val masterKeyInitializationVectorBase64 =
-        encryptedPrefs.getString(INITIALIZATION_VECTOR_ACCESS_KEY, null)
-
-      if (encryptedMasterKeyBase64 != null && masterKeyInitializationVectorBase64 != null) {
-        // Decrypt and return the existing master key
-        val encryptedMasterKey = Base64.decode(encryptedMasterKeyBase64, Base64.DEFAULT)
-        val iv = Base64.decode(masterKeyInitializationVectorBase64, Base64.DEFAULT)
-        accessMasterKeyUsingBiometrics(encryptedMasterKey, iv, onSuccess, onFailure)
+      val encryptedPrefs = getEncryptedPrefs(context)
+      if (credential != null) {
+        // Use the KEK-based flow.
+        authenticateMasterKeyUsingCredentials(credential, onSuccess, onFailure)
       } else {
-        // Encrypt and store the master key using the Keystore and biometric prompt.
-        generateMasterKeyUsingBiometrics(encryptedPrefs, masterKey, onSuccess, onFailure)
+        // Biometric flow (unchanged)
+        println("No credential provided; falling back to biometric authentication.")
+
+        if (!canAuthenticate()) {
+          onFailure("Device does not support biometrics or device credentials")
+          return
+        }
+
+        val encryptedMasterKeyBase64 = encryptedPrefs.getString(ENCRYPTED_MASTER_KEY_BIO_ACCESS_KEY, null)
+        val masterKeyInitializationVectorBase64 = encryptedPrefs.getString(INITIALIZATION_VECTOR_BIO_ACCESS_KEY, null)
+
+        if (encryptedMasterKeyBase64 != null && masterKeyInitializationVectorBase64 != null) {
+          accessMasterKeyUsingBiometrics(
+            Base64.decode(encryptedMasterKeyBase64, Base64.DEFAULT),
+            Base64.decode(masterKeyInitializationVectorBase64, Base64.DEFAULT),
+            onSuccess,
+            onFailure
+          )
+        } else {
+          // Encrypt and store the master key using the Keystore and biometric prompt.
+          generateMasterKeyUsingBiometrics(encryptedPrefs, onSuccess, onFailure)
+        }
       }
     } catch (e: Exception) {
+      println("Authentication failed: ${e.message}")
       onFailure("Failed to authenticate: ${e.message}")
     }
   }
 
+  /**
+   * Generates a new master key or Accesses an existing master key using the provided credential (password or recovery key).
+   * Derives the Key Encryption Key (KEK) from the credential and uses it to unwrap (decrypt) the master key.
+   *
+   * During generation the master key is wrapped (encrypted) using a KEK derived from the credential and stored.
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  fun authenticateMasterKeyUsingCredentials(
+    credential: String,
+    onSuccess: (ByteArray, recoveryKey: String?) -> Unit,
+    onFailure: (String) -> Unit
+  ) {
+    try {
+      // Resolve credential info to get the derived KEK and storage keys.
+      val info = resolveCredentialInfo(credential, context)
+
+      // Retrieve the stored wrapped master key.
+      val encryptedPrefs = getEncryptedPrefs(context)
+      val encryptedMasterKeyBase64 = encryptedPrefs.getString(info.encryptedKeyKey, null)
+      val masterKeyIVBase64 = encryptedPrefs.getString(info.ivKey, null)
+
+      if (encryptedMasterKeyBase64 != null && masterKeyIVBase64 != null) {
+        println("Accessing master key using credentials. Recovery mode: ${info.isRecovery}")
+
+        // Decode the stored wrapped master key and its IV.
+        val encryptedMasterKeyBytes = Base64.decode(encryptedMasterKeyBase64, Base64.DEFAULT)
+        val ivBytes = Base64.decode(masterKeyIVBase64, Base64.DEFAULT)
+        val wrappedKeyResult = WrappedKeyResult(encryptedMasterKeyBytes, ivBytes)
+
+        // Unwrap (decrypt) the master key using the derived KEK.
+        val unwrappedMasterKey = unwrapEncryptionKey(wrappedKeyResult, info.derivedKEK)
+
+        println("Master key successfully unwrapped using credentials.")
+        onSuccess(unwrappedMasterKey, null)
+      } else {
+        println("Generating master key using credentials. Recovery mode: ${info.isRecovery}")
+
+        // Generate a new 32-byte master key if one isn’t provided.
+        val newMasterKey = LibsodiumRandom.buf(32).toByteArray()
+        require(newMasterKey.size == 32) { "Master key must be 32 bytes" }
+
+        // Generate a recovery key (this may be null for password-based flows if desired).
+        val recoveryKey = generateRecoveryKey()
+
+        // Wrap the master key using the derived KEK.
+        val wrappedKeyResult = wrapEncryptionKey(newMasterKey, info.derivedKEK)
+        val encryptedKeyBase64 = Base64.encodeToString(wrappedKeyResult.encryptedKey, Base64.DEFAULT)
+        val ivBase64 = Base64.encodeToString(wrappedKeyResult.wrappingNonce, Base64.DEFAULT)
+
+        // Persist the wrapped key and IV under the appropriate keys.
+        encryptedPrefs.edit {
+          putString(info.encryptedKeyKey, encryptedKeyBase64)
+          putString(info.ivKey, ivBase64)
+        }
+
+        println("New master key generated and stored using credentials.")
+        onSuccess(newMasterKey, recoveryKey)
+      }
+    } catch (e: Exception) {
+      onFailure("Failed to access and/or generate master key using credentials: ${e.message}")
+    }
+  }
+
+  /**
+   * Generates a new master key using biometric authentication (fingerprint, face unlock, lockscreen pin, etc...).
+   * Derives the Key Encryption Key (KEK) using biometric ciphers and uses it to wrap (encrypt) the master key and store it.
+   */
   @OptIn(ExperimentalUnsignedTypes::class)
   private fun generateMasterKeyUsingBiometrics(
     encryptedPrefs: SharedPreferences,
-    _masterKey: ByteArray?,
     onSuccess: (ByteArray, recoveryKey: String?) -> Unit,
     onFailure: (String) -> Unit
   ) {
@@ -142,11 +323,12 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
         super.onAuthenticationSucceeded(result)
         try {
           val cipher = result.cryptoObject?.cipher
-            ?: throw IllegalStateException("CryptoObject Cipher is null")
+            ?: throw IllegalStateException("Biometric CryptoObject Cipher is null for generating the master key")
 
           // Generate a 32-byte master key using LibSodium or use the provided masterKey
-          val masterKey = _masterKey ?: LibsodiumRandom.buf(32).toByteArray()
+          val masterKey = LibsodiumRandom.buf(32).toByteArray()
           require(masterKey.size == 32) { "Master key must be 32 bytes" }
+
           // Generate a recovery key for the master unlock process.
           val recoveryKey = generateRecoveryKey()
 
@@ -159,23 +341,23 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
 
           // Store the encrypted master key
           encryptedPrefs.edit {
-            putString(ENCRYPTED_MASTER_KEY_ACCESS_KEY, encryptedMasterKeyBase64)
-            putString(INITIALIZATION_VECTOR_ACCESS_KEY, ivBase64)
+            putString(ENCRYPTED_MASTER_KEY_BIO_ACCESS_KEY, encryptedMasterKeyBase64)
+            putString(INITIALIZATION_VECTOR_BIO_ACCESS_KEY, ivBase64)
           }
 
           // Return the master key and the generated recovery key
           onSuccess(masterKey, recoveryKey)
         } catch (e: Exception) {
-          onFailure("Failed to generate and store master key: ${e.message}")
+          onFailure("Failed to generate and store master key for biometric authentication: ${e.message}")
         }
       }
 
       override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-        onFailure("Authentication error: $errString")
+        onFailure("Biometric Authentication error: $errString")
       }
 
       override fun onAuthenticationFailed() {
-        onFailure("Authentication failed")
+        onFailure("Biometric Authentication failed")
       }
     })
 
@@ -197,6 +379,10 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
     biometricPrompt.authenticate(promptInfo, cryptoObject)
   }
 
+  /**
+   * Access the existing master key using biometric authentication (fingerprint, face unlock, lockscreen pin, etc...).
+   * Derives the Key Encryption Key (KEK) using biometric ciphers and uses it to unwrap (decrypt) the master key for use.
+   */
   private fun accessMasterKeyUsingBiometrics(
     encryptedMasterKey: ByteArray,
     iv: ByteArray,
@@ -209,21 +395,21 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
         super.onAuthenticationSucceeded(result)
         try {
           val cipher = result.cryptoObject?.cipher
-            ?: throw IllegalStateException("CryptoObject Cipher is null")
+            ?: throw IllegalStateException("Biometric CryptoObject Cipher is null for accessing the master key")
 
           val masterKey = cipher.doFinal(encryptedMasterKey)
           onSuccess(masterKey, null)
         } catch (e: Exception) {
-          onFailure("Decryption failed: ${e.message}")
+          onFailure("Biometric Decryption failed: ${e.message}")
         }
       }
 
       override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-        onFailure("Authentication error: $errString")
+        onFailure("Biometric Authentication error: $errString")
       }
 
       override fun onAuthenticationFailed() {
-        onFailure("Authentication failed")
+        onFailure("Biometric Authentication failed")
       }
     })
 
@@ -245,36 +431,76 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
     biometricPrompt.authenticate(promptInfo, cryptoObject)
   }
 
-  /**
-   * VAULT (FOLDER) ENCRYPTION
+  @OptIn(ExperimentalUnsignedTypes::class)/**
+   * Changes the password used for KEK-wrapped master key protection.
    *
-   * The vault keys are derived (hashed) from their respective passwords.
-   * They are then encrypted with the master key and stored in the database.
-   * Use these helper methods when adding or retrieving a vault.
+   * This function assumes that both the old and new credentials are password-based (i.e. do not start with the recovery prefix).
+   *
+   * @param oldPassword The current password.
+   * @param newPassword The new password.
+   * @param onSuccess Callback indicating the password change was successful.
+   * @param onFailure Callback with an error message if something goes wrong.
    */
-  /**
-   * Encrypts the vault key using the master key.
-   * Returns a pair of the encrypted vault key and the nonce used.
-   */
-  @OptIn(ExperimentalUnsignedTypes::class)
-  fun encryptVaultKeyWithMaster(
-    vaultKey: ByteArray,
-    masterKey: ByteArray
-  ): Pair<ByteArray, ByteArray> {
-    val (encryptedData, nonce) = encryptData(vaultKey.toUByteArray(), masterKey)
-    return Pair(encryptedData.toByteArray(), nonce.toByteArray())
-  }
+  fun changePassword(
+    oldPassword: String,
+    newPassword: String,
+    onSuccess: (String) -> Unit,
+    onFailure: (String) -> Unit
+  ) {
+    try {
+      // Ensure we're dealing with password credentials (not recovery keys)
+      if (oldPassword.startsWith(RECOVERY_KEY_PREFIX) || newPassword.startsWith(RECOVERY_KEY_PREFIX)) {
+        onFailure("Recovery keys cannot be used to change passwords")
+        return
+      }
+      // Resolve credential info for the old password.
+      val oldInfo = resolveCredentialInfo(oldPassword, context)
 
-  /**
-   * Decrypts the vault key using the master key.
-   */
-  @OptIn(ExperimentalUnsignedTypes::class)
-  fun decryptVaultKeyWithMaster(
-    encryptedVaultKey: ByteArray,
-    nonce: ByteArray,
-    masterKey: ByteArray
-  ): UByteArray {
-    return decryptData(encryptedVaultKey.toUByteArray(), nonce.toUByteArray(), masterKey)
+      // We expect the password-based storage keys.
+      if (oldInfo.encryptedKeyKey != ENCRYPTED_MASTER_KEY_PW_ACCESS_KEY) {
+        onFailure("Old credential is not a valid password")
+        return
+      }
+
+      val encryptedPrefs = getEncryptedPrefs(context)
+      val encryptedMasterKeyBase64 = encryptedPrefs.getString(oldInfo.encryptedKeyKey, null)
+      val ivBase64 = encryptedPrefs.getString(oldInfo.ivKey, null)
+
+      if (encryptedMasterKeyBase64 == null || ivBase64 == null) {
+        onFailure("No password-wrapped master key found")
+        return
+      }
+
+      // Decode the stored wrapped master key.
+      val encryptedMasterKeyBytes = Base64.decode(encryptedMasterKeyBase64, Base64.DEFAULT)
+      val ivBytes = Base64.decode(ivBase64, Base64.DEFAULT)
+      val wrappedKeyResult = WrappedKeyResult(encryptedMasterKeyBytes, ivBytes)
+
+      // Unwrap the master key using the old KEK.
+      val masterKey = unwrapEncryptionKey(wrappedKeyResult, oldInfo.derivedKEK)
+
+      // Derive a new KEK from the new password.
+      val newInfo = resolveCredentialInfo(newPassword, context)
+      if (newInfo.encryptedKeyKey != ENCRYPTED_MASTER_KEY_PW_ACCESS_KEY) {
+        onFailure("New credential is not a valid password")
+        return
+      }
+
+      // Re-wrap (encrypt) the master key using the new KEK.
+      val newWrappedKeyResult = wrapEncryptionKey(masterKey, newInfo.derivedKEK)
+      val newEncryptedKeyBase64 = Base64.encodeToString(newWrappedKeyResult.encryptedKey, Base64.DEFAULT)
+      val newIvBase64 = Base64.encodeToString(newWrappedKeyResult.wrappingNonce, Base64.DEFAULT)
+
+      // Save the updated wrapped master key and IV to secure storage.
+      encryptedPrefs.edit {
+        putString(newInfo.encryptedKeyKey, newEncryptedKeyBase64)
+        putString(newInfo.ivKey, newIvBase64)
+      }
+
+      onSuccess("Password changed successfully")
+    } catch (e: Exception) {
+      onFailure("Failed to change password: ${e.message}")
+    }
   }
 
   /**
@@ -332,25 +558,197 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
 
   // Generate a nonce for encryption
   @OptIn(ExperimentalUnsignedTypes::class)
-  fun generateNonce(): UByteArray {
-    return LibsodiumRandom.buf(crypto_secretbox_NONCEBYTES)
+  fun generateNonce(): UByteArray = LibsodiumRandom.buf(crypto_secretbox_NONCEBYTES)
+
+  /**
+   * Wraps (encrypts) an encryption key using the provided parent key.
+   * Returns a WrappedKeyResult containing the encrypted key and its wrapping nonce.
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  fun wrapEncryptionKey(
+    key: ByteArray,
+    parentKey: ByteArray,
+    wrappingNonce: UByteArray = generateNonce()
+  ): WrappedKeyResult {
+    val (encryptedData, _) = encryptData(key.toUByteArray(), parentKey, wrappingNonce)
+    return WrappedKeyResult(encryptedData.toByteArray(), wrappingNonce.toByteArray())
   }
 
-  // Encrypts data using Libsodium and the master key fetched from EncryptedSharedPreferences.
+  /**
+   * Unwraps (decrypts) an encryption key using the provided parent key and wrapping nonce.
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  fun unwrapEncryptionKey(
+    wrappedKey: WrappedKeyResult,
+    parentKey: ByteArray
+  ): ByteArray {
+    return decryptData(
+      wrappedKey.encryptedKey.toUByteArray(),
+      wrappedKey.wrappingNonce.toUByteArray(),
+      parentKey
+    ).toByteArray()
+  }
+
+  /**
+   * Rotates the encryption wrapping for the wrapped key (e.g., a file key).
+   *
+   * Unwrap the stored key using the parent key and the wrapping nonce,
+   * then re-wraps it with a new wrapping nonce. This allows encryption key rotation without re-encrypting
+   * the underlying data.
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  fun rotateEncryptionKey(
+    wrappedKey: WrappedKeyResult,
+    parentKey: ByteArray
+  ): WrappedKeyResult  {
+    val key = unwrapEncryptionKey(wrappedKey, parentKey)
+    val newWrappingNonce = generateNonce()
+    return wrapEncryptionKey(key, parentKey, newWrappingNonce)
+  }
+
+  /**
+   * Re-wraps an encryption key for sharing with a recipient.
+   *
+   * Implementation approach:
+   * 1. Unwrap the wrapped encryption key using the parent key.
+   * 2. Seal (asymmetrically encrypt) the raw encryption key using the recipient’s public key.
+   *    We use Libsodium's crypto_box_seal (via Box.seal) for this purpose.
+   * 3. Return the sealed encryption key.
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  fun wrapEncryptionKeyForSharing(
+    wrappedKey: WrappedKeyResult,
+    parentKey: ByteArray,
+    recipientPublicKey: ByteArray
+  ): ByteArray {
+    val key = unwrapEncryptionKey(wrappedKey, parentKey)
+    val sealed = Box.seal(key.toUByteArray(), recipientPublicKey.toUByteArray())
+    return sealed.toByteArray()
+  }
+
+  /**
+   * Unwraps a shared encryption key that was sealed using LibSodium's Box.seal.
+   *
+   * Reverses the wrapping done in `wrapEncryptionKeyForSharing`, uses the
+   * recipient's key pair (public and private keys) to unseal the wrapped encryption key.
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  fun unwrapSharedEncryptionKey(
+    sealedKey: ByteArray,
+    recipientPublicKey: ByteArray,
+    recipientPrivateKey: ByteArray
+  ): ByteArray {
+    // Convert input keys to UByteArray and attempt to open the sealed box.
+    val unsealedKey = Box.sealOpen(
+      sealedKey.toUByteArray(),
+      recipientPublicKey.toUByteArray(),
+      recipientPrivateKey.toUByteArray()
+    )
+
+    // If the unsealing fails, throw an exception.
+    if (unsealedKey == null) {
+      throw IllegalStateException("Failed to unseal the shared encryption key.")
+    }
+
+    // Return the recovered key as a ByteArray.
+    return unsealedKey.toByteArray()
+  }
+
+  /**
+   * Encrypts raw data using LibSodium's SecretBox.
+   * Returns a pair of (encryptedData, dataNonce).
+   */
   @OptIn(ExperimentalUnsignedTypes::class)
   fun encryptData(
     data: UByteArray,
-    masterKey: ByteArray,
+    key: ByteArray,
     nonce: UByteArray = generateNonce()
   ): Pair<UByteArray, UByteArray> {
-    val encryptedData = SecretBox.easy(data, nonce, masterKey.toUByteArray())
+    val encryptedData = SecretBox.easy(data, nonce, key.toUByteArray())
     return Pair(encryptedData, nonce) // Save nonce with encrypted data
   }
 
-  // Decrypts data using Libsodium and the master key fetched from EncryptedSharedPreferences.
+  /**
+   * Decrypts data using LibSodium's SecretBox.
+   */
   @OptIn(ExperimentalUnsignedTypes::class)
-  fun decryptData(encryptedData: UByteArray, nonce: UByteArray, masterKey: ByteArray): UByteArray {
-    return SecretBox.openEasy(encryptedData, nonce, masterKey.toUByteArray())
+  fun decryptData(
+    encryptedData: UByteArray,
+    nonce: UByteArray,
+    key: ByteArray
+  ): UByteArray = SecretBox.openEasy(encryptedData, nonce, key.toUByteArray())
+
+  /**
+   * Encrypt data in chunks using SecretStream.xChaCha20Poly1305.
+   * @param data The entire plaintext to encrypt (e.g., a large file read into memory).
+   * @param key A 32-byte encryption key (e.g., from LibsodiumRandom.buf(32)).
+   * @param chunkSize Size of each plaintext chunk to process.
+   * @return A ByteArray containing [header + encrypted chunks].
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  suspend fun encryptDataInChunks(
+    data: ByteArray,
+    key: ByteArray,
+    chunkSize: Int = 4096
+  ): ByteArray {
+    // 1. Initialize push state.
+    val (state, header) = SecretStream.xChaCha20Poly1305InitPush(key.toUByteArray())
+
+    // We'll collect our ciphertext in a list for demonstration.
+    val output = mutableListOf<UByte>()
+
+    // The header must be stored or transmitted alongside the ciphertext.
+    // Prepend it to the final output so the decrypt side can reconstruct.
+    output.addAll(header.toList())
+
+    // 2. Encrypt in chunks.
+    val totalChunks = (data.size + chunkSize - 1) / chunkSize
+    for (i in 0 until totalChunks) {
+      // Check for cancellation
+      if (!coroutineContext.isActive) {
+        throw CancellationException("Encryption cancelled.")
+      }
+
+      // Optional small delay/yield to give cancellation a chance to happen
+      delay(5)
+      yield()
+
+      val start = i * chunkSize
+      val end = minOf(start + chunkSize, data.size)
+      val chunk = data.sliceArray(start until end)
+
+      // Encrypt this chunk
+      val encryptedChunk =
+        SecretStream.xChaCha20Poly1305Push(state, chunk.toUByteArray(), ubyteArrayOf(), crypto_secretstream_xchacha20poly1305_TAG_MESSAGE.toUByte())
+      output.addAll(encryptedChunk.toList())
+    }
+
+    // 3. Finalize the stream
+    val finalChunk = SecretStream.xChaCha20Poly1305Push(state, ByteArray(0).toUByteArray(), ubyteArrayOf(), crypto_secretstream_xchacha20poly1305_TAG_FINAL.toUByte())
+    output.addAll(finalChunk.toList())
+
+    return output.toUByteArray().toByteArray()
+  }
+
+  /**
+   * Encrypts file content with cancellation support.
+   * Returns a FileEncryptionResult containing the encrypted file data, the data nonce,
+   * and the wrapped file key (which itself contains a wrapping nonce).
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  suspend fun encryptFileContentWithCancellation(
+    fileData: ByteArray,
+    vaultKey: ByteArray
+  ): Pair<ByteArray, WrappedKeyResult> {
+    // Generate a new random file key using xChaCha20 + Poly1305
+    val fileKey = SecretStream.xChaCha20Poly1305Keygen().toByteArray()
+
+    // Encrypt file data (the nonce used here is for the file data encryption).
+    val encryptedFileDataWithNonce = encryptDataInChunks(fileData, fileKey)
+
+    // Wrap the file key using the vault key (using its own wrapping nonce).
+    val wrappedKey = wrapEncryptionKey(fileKey, vaultKey)
+    return Pair(encryptedFileDataWithNonce, wrappedKey)
   }
 
   /**
@@ -359,9 +757,7 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
    * @param fileName The original file name or path.
    * @return The file name with ".enc" appended.
    */
-  private fun addEncryptionExtension(fileName: String): String {
-    return "$fileName.enc"
-  }
+  private fun addEncryptionExtension(fileName: String): String = "$fileName.enc"
 
   /**
    * Removes the ".enc" extension from a file name or path during decryption.
@@ -383,43 +779,61 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
    * @param fileName The file name to check.
    * @return True if the file name has an ".enc" extension, false otherwise.
    */
-  private fun hasEncryptionExtension(fileName: String): Boolean {
-    return fileName.endsWith(".enc")
-  }
+  private fun hasEncryptionExtension(fileName: String): Boolean = fileName.endsWith(".enc")
 
   /**
-   * Encrypts all files in the folder and saves them with encrypted content.
-   * Preserves the folder structure using DocumentFile.
+   * Encrypts all files within a DocumentFile folder.
+   *
+   * For each file:
+   * 1. Generate a new random file key.
+   * 2. Encrypt the file's content using the file key (via a suspend function that supports cancellation).
+   * 3. Wrap the file key using the provided vault key.
+   * 4. Create a new file with an appended ".enc" extension and write the encrypted data.
+   *
+   * Returns a map from the encrypted file's URI to a pair of (wrapped file key, file nonce)
+   * so that this metadata can be stored in the database.
    */
   @OptIn(ExperimentalUnsignedTypes::class)
-  fun encryptDocumentFolder(
+  suspend fun encryptDocumentFolder(
     folder: DocumentFile,
     vaultKey: ByteArray,
-    masterKey: ByteArray,
-    vaultNonce: UByteArray = generateNonce()
-  ): Pair<DocumentFile, ByteArray> {
-    folder.listFiles().forEach { file ->
+  ): Map<Uri, FileEncryptionResult> {
+    val resultMap = mutableMapOf<Uri, Pair<ByteArray, ByteArray>>()
+    for (file in folder.listFiles()) {
       if (file.isFile) {
-
-        val fileName = file.name ?: "unknown_file"
-        val encryptedFileName = addEncryptionExtension(fileName)
-        val encryptedFile = folder.createFile("application/octet-stream", encryptedFileName)
-          ?: throw IllegalArgumentException("Failed to create encrypted file: $encryptedFileName")
-
+        // Read original file data.
         val fileData = context.contentResolver.openInputStream(file.uri)?.readBytes()
-          ?: throw IllegalArgumentException("Failed to read file data: ${file.uri}")
+          ?: continue
 
-        val (encryptedData, nonce) = encryptData(fileData.toUByteArray(), vaultKey)
-        val (lockedData) = encryptData((nonce + encryptedData), masterKey, vaultNonce)
+        // Generate a new random file key.
+        val fileKey = LibsodiumRandom.buf(32).toByteArray()
 
-        // Save nonce + encrypted content in the encrypted file
+        // Encrypt the file data using the file key with cancellation support.
+        val (encryptedData, fileDataNonce) = encryptDataInChunks(fileData, fileKey)
+
+        // Wrap the file key with the vault key.
+        val wrappedFileKey = wrapEncryptionKey(fileKey, vaultKey)
+
+        // Create a new file with ".enc" appended to its name.
+        val originalName = file.name ?: "unknown_file"
+        val encryptedFileName = addEncryptionExtension(originalName)
+        val encryptedFile = folder.createFile("application/octet-stream", encryptedFileName)
+          ?: continue
+
+        // Write the encrypted data.
         context.contentResolver.openOutputStream(encryptedFile.uri)?.use {
-          it.write(lockedData.toByteArray())
+          it.write(encryptedData)
         }
+        // Map the encrypted file URI to its wrapped file key and nonce.
+        resultMap[encryptedFile.uri] = FileEncryptionResult(
+          wrappedFileKey = wrappedFileKey,
+          dataNonce = fileDataNonce,
+          encryptedFileData = encryptedData
+        )
       }
     }
 
-    return Pair(folder, vaultNonce.toByteArray())
+    return resultMap
   }
 
   /**

@@ -1,5 +1,8 @@
 package com.example.vault.ui.login
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.lifecycle.Observer
 import androidx.lifecycle.ViewModelProvider
 import androidx.annotation.StringRes
@@ -11,16 +14,11 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
-import android.widget.TextView
 import android.widget.Toast
-import androidx.core.net.toUri
-import androidx.navigation.fragment.findNavController
 import com.example.vault.databinding.FragmentMasterUnlockBinding
 
 import com.example.vault.R
 import com.example.vault.SecureKeyVault
-import com.example.vault.databinding.FragmentFolderpickerBinding
-import com.example.vault.db.Vault
 import com.example.vault.db.VaultDatabase
 import com.ionspin.kotlin.crypto.util.encodeToUByteArray
 import java.nio.charset.Charset
@@ -121,8 +119,18 @@ class MasterUnlockFragment : Fragment() {
 
     passwordUnlockButton.setOnClickListener {
       // Generate a new master key from a password input.
-      val dummyPassword = passwordEditText.text.toString()
-      val masterKey = SecureKeyVault.deriveKeyFromPassword(dummyPassword)
+      val password = passwordEditText.text.toString()
+      val masterKey = if (password.startsWith("${SecureKeyVault.RECOVERY_KEY_PREFIX}-")) {
+        SecureKeyVault.deriveKeyFromPassword(
+          password = password,
+          context = it.context
+        )
+      } else {
+        SecureKeyVault.deriveKeyFromPassword(
+          recoveryKey = password,
+          context = it.context
+        )
+      }
 
       loadingProgressBar.visibility = View.VISIBLE
       loginViewModel.login(
@@ -135,11 +143,12 @@ class MasterUnlockFragment : Fragment() {
       keyVault.init {
         keyVault.authenticate(
           masterKey = null,
+          credential = null,
           onSuccess = { masterKey, recoveryKey ->
             if (recoveryKey != null) {
               val clipboard = requireContext()
-                .getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-              val clip = android.content.ClipData.newPlainText("Recovery Key", recoveryKey)
+                .getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+              val clip = ClipData.newPlainText("Recovery Key", recoveryKey)
               clipboard.setPrimaryClip(clip)
               Toast.makeText(
                 requireContext(),
