@@ -27,9 +27,16 @@ import com.ionspin.kotlin.crypto.secretstream.SecretStream
 import com.ionspin.kotlin.crypto.secretstream.crypto_secretstream_xchacha20poly1305_TAG_FINAL
 import com.ionspin.kotlin.crypto.secretstream.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE
 import com.ionspin.kotlin.crypto.util.LibsodiumRandom
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -64,7 +71,6 @@ data class CredentialInfo(
   val ivKey: String,
   val isRecovery: Boolean
 )
-
 
 class SecureKeyVault(private val context: Context, private val activity: Fragment) {
 
@@ -679,79 +685,6 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
   ): UByteArray = SecretBox.openEasy(encryptedData, nonce, key.toUByteArray())
 
   /**
-   * Encrypt data in chunks using SecretStream.xChaCha20Poly1305.
-   * @param data The entire plaintext to encrypt (e.g., a large file read into memory).
-   * @param key A 32-byte encryption key (e.g., from LibsodiumRandom.buf(32)).
-   * @param chunkSize Size of each plaintext chunk to process.
-   * @return A ByteArray containing [header + encrypted chunks].
-   */
-  @OptIn(ExperimentalUnsignedTypes::class)
-  suspend fun encryptDataInChunks(
-    data: ByteArray,
-    key: ByteArray,
-    chunkSize: Int = 4096
-  ): ByteArray {
-    // 1. Initialize push state.
-    val (state, header) = SecretStream.xChaCha20Poly1305InitPush(key.toUByteArray())
-
-    // We'll collect our ciphertext in a list for demonstration.
-    val output = mutableListOf<UByte>()
-
-    // The header must be stored or transmitted alongside the ciphertext.
-    // Prepend it to the final output so the decrypt side can reconstruct.
-    output.addAll(header.toList())
-
-    // 2. Encrypt in chunks.
-    val totalChunks = (data.size + chunkSize - 1) / chunkSize
-    for (i in 0 until totalChunks) {
-      // Check for cancellation
-      if (!coroutineContext.isActive) {
-        throw CancellationException("Encryption cancelled.")
-      }
-
-      // Optional small delay/yield to give cancellation a chance to happen
-      delay(5)
-      yield()
-
-      val start = i * chunkSize
-      val end = minOf(start + chunkSize, data.size)
-      val chunk = data.sliceArray(start until end)
-
-      // Encrypt this chunk
-      val encryptedChunk =
-        SecretStream.xChaCha20Poly1305Push(state, chunk.toUByteArray(), ubyteArrayOf(), crypto_secretstream_xchacha20poly1305_TAG_MESSAGE.toUByte())
-      output.addAll(encryptedChunk.toList())
-    }
-
-    // 3. Finalize the stream
-    val finalChunk = SecretStream.xChaCha20Poly1305Push(state, ByteArray(0).toUByteArray(), ubyteArrayOf(), crypto_secretstream_xchacha20poly1305_TAG_FINAL.toUByte())
-    output.addAll(finalChunk.toList())
-
-    return output.toUByteArray().toByteArray()
-  }
-
-  /**
-   * Encrypts file content with cancellation support.
-   * Returns a FileEncryptionResult containing the encrypted file data, the data nonce,
-   * and the wrapped file key (which itself contains a wrapping nonce).
-   */
-  @OptIn(ExperimentalUnsignedTypes::class)
-  suspend fun encryptFileContentWithCancellation(
-    fileData: ByteArray,
-    vaultKey: ByteArray
-  ): Pair<ByteArray, WrappedKeyResult> {
-    // Generate a new random file key using xChaCha20 + Poly1305
-    val fileKey = SecretStream.xChaCha20Poly1305Keygen().toByteArray()
-
-    // Encrypt file data (the nonce used here is for the file data encryption).
-    val encryptedFileDataWithNonce = encryptDataInChunks(fileData, fileKey)
-
-    // Wrap the file key using the vault key (using its own wrapping nonce).
-    val wrappedKey = wrapEncryptionKey(fileKey, vaultKey)
-    return Pair(encryptedFileDataWithNonce, wrappedKey)
-  }
-
-  /**
    * Appends a ".enc" extension to a file name or path during encryption.
    *
    * @param fileName The original file name or path.
@@ -780,6 +713,145 @@ class SecureKeyVault(private val context: Context, private val activity: Fragmen
    * @return True if the file name has an ".enc" extension, false otherwise.
    */
   private fun hasEncryptionExtension(fileName: String): Boolean = fileName.endsWith(".enc")
+
+  /**
+   * Encrypts a single DocumentFile by streaming its content into a temporary file in the app's cache.
+   * Once encryption is complete, the encrypted file is copied into the target DocumentFile folder with a ".enc" extension,
+   * and the temporary file is deleted.
+   *
+   * @param sourceDocument The original file to encrypt (as a DocumentFile).
+   * @param vaultKey The vault key used for encryption.
+   * @param context The Android context.
+   * @param chunkSize Size of each chunk for streaming encryption.
+   * @return The URI of the final encrypted file.
+   */
+  suspend fun encryptFileUsingTempFolder(
+    sourceDocument: DocumentFile,
+    vaultKey: ByteArray,
+    context: Context,
+    chunkSize: Int = 4096
+  ): Uri = withContext(Dispatchers.IO) {
+    // 1. Create a temporary file in the app's cache directory.
+    val tempDir = context.cacheDir
+    val tempFile = File.createTempFile("encrypt_temp", null, tempDir)
+
+    // 2. Open an InputStream from the DocumentFile and stream-encrypt its contents into the temporary file.
+    context.contentResolver.openInputStream(sourceDocument.uri)?.use { inputStream ->
+      FileOutputStream(tempFile).use { fos ->
+        // This function is responsible for reading from inputStream, encrypting in chunks,
+        // and writing directly to fos.
+        encryptStream(inputStream, fos, vaultKey, chunkSize)
+      }
+    } ?: throw IllegalArgumentException("Unable to open input stream for ${sourceDocument.uri}")
+
+    // 3. Once encryption is complete, create the final encrypted file in the original folder.
+    val folder = sourceDocument.parentFile
+      ?: throw IllegalArgumentException("Source file has no parent folder")
+    val originalName = sourceDocument.name ?: "unknown_file"
+    val finalFileName = addEncryptionExtension(originalName)
+    val encryptedDocument = folder.createFile("application/octet-stream", finalFileName)
+      ?: throw IllegalArgumentException("Failed to create encrypted file in folder")
+
+    // 4. Copy the temporary file into the final DocumentFile.
+    context.contentResolver.openOutputStream(encryptedDocument.uri)?.use { finalOut ->
+      FileInputStream(tempFile).use { tempIn ->
+        tempIn.copyTo(finalOut)
+      }
+    } ?: throw IllegalArgumentException("Failed to open output stream for ${encryptedDocument.uri}")
+
+    // 5. Clean up: delete the temporary file and optionally the original file.
+    tempFile.delete()
+    // Optionally delete the original file if desired:
+    // sourceDocument.delete()
+
+    encryptedDocument.uri
+  }
+
+  /**
+   * Streams encryption: reads data from an InputStream, encrypts it in chunks,
+   * and writes the encrypted output to an OutputStream.
+   */
+  @OptIn(ExperimentalUnsignedTypes::class)
+  suspend fun encryptStream(
+    input: InputStream,
+    output: OutputStream,
+    key: ByteArray,
+    chunkSize: Int = 4096
+  ) = withContext(Dispatchers.IO) {
+    // Initialize secret stream push state.
+    val (state, header) = SecretStream.xChaCha20Poly1305InitPush(key.toUByteArray())
+    // Write the header first.
+    output.write(header.toByteArray())
+
+    val buffer = ByteArray(chunkSize)
+    while (true) {
+      if (!coroutineContext.isActive) {
+        throw CancellationException("Encryption cancelled.")
+      }
+      // Optional delay/yield to allow cancellation.
+      delay(5)
+      yield()
+
+      val bytesRead = input.read(buffer)
+      if (bytesRead == -1) break
+
+      val chunk = if (bytesRead < chunkSize) buffer.copyOf(bytesRead) else buffer
+      val encryptedChunk = SecretStream.xChaCha20Poly1305Push(
+        state,
+        chunk.toUByteArray(),
+        ubyteArrayOf(),
+        crypto_secretstream_xchacha20poly1305_TAG_MESSAGE.toUByte()
+      )
+      output.write(encryptedChunk.toByteArray())
+    }
+
+    // Finalize the stream with the FINAL tag.
+    val finalChunk = SecretStream.xChaCha20Poly1305Push(
+      state,
+      ByteArray(0).toUByteArray(),
+      ubyteArrayOf(),
+      crypto_secretstream_xchacha20poly1305_TAG_FINAL.toUByte()
+    )
+    output.write(finalChunk.toByteArray())
+  }
+
+  suspend fun encryptVaultFiles(
+    vaultId: Long,
+    vaultKey: ByteArray,
+    context: Context
+  ) = withContext(Dispatchers.IO) {
+    // 1. Retrieve vault file entries from SQLite for the given vaultId.
+    val files = database.getFilesForVault(vaultId)
+
+    files.forEach { fileRecord ->
+      // Check if the file is already encrypted (either by a flag or by extension)
+      if (fileRecord.isEncrypted) return@forEach
+
+      // 2. Get the DocumentFile representing the file.
+      val documentFile = getDocumentFileFromPath(fileRecord.path)
+      if (documentFile == null) {
+        // Log or handle error: file missing
+        return@forEach
+      }
+
+      // 3. Encrypt the file using the temporary folder approach.
+      val encryptedUri = encryptFileUsingTempFolder(
+        sourceDocument = documentFile,
+        vaultKey = vaultKey,
+        context = context
+      )
+
+      // 4. Update the vault record in SQLite.
+      database.updateFileEncryptionStatus(
+        fileId = fileRecord.id,
+        encryptedPath = encryptedUri.toString(),  // new file location
+        isEncrypted = true,
+        nonce = fileRecord.nonce,         // update with new nonce if applicable
+        wrappedKey = fileRecord.wrappedKey // update with new wrapped file key if applicable
+      )
+    }
+  }
+
 
   /**
    * Encrypts all files within a DocumentFile folder.
