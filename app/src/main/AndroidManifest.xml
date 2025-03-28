@@ -15,7 +15,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Vault"
         tools:targetApi="tiramisu">
-
         <!-- Splash Activity -->
         <activity
             android:name=".SplashActivity"
@@ -24,28 +23,21 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
-
-        <!-- Intro Activity -->
+        </activity> <!-- Intro Activity -->
         <activity
             android:name=".IntroActivity"
-            android:exported="true" />
-
-        <!-- Main Activity -->
+            android:exported="true" /> <!-- Main Activity -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
             <!-- Main activity is launched after onboarding -->
-        </activity>
-
-        <!-- Google Services Meta-data -->
+        </activity> <!-- Google Services Meta-data -->
         <meta-data
             android:name="com.google.android.gms.version"
             android:value="@integer/google_play_services_version" />
         <meta-data
             android:name="com.google.android.geo.API_KEY"
             android:value="${GOOGLE_KEY}" />
-
     </application>
 
 </manifest>

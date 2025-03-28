@@ -62,7 +62,6 @@ class VaultViewAdapter(private var db: VaultDatabase, private var keyVault: Secu
             //todo: add encryption functionality
             keyVault.init {
                 keyVault.authenticate(
-                    masterKey = null,
                     onSuccess = { masterKey, recoveryKey ->
 
                         if (recoveryKey != null) {
